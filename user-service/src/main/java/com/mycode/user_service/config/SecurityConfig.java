@@ -37,6 +37,7 @@ public class SecurityConfig { // Renamed to SecurityConfig
                 .authorizeHttpRequests(auth -> auth
 //                        .requestMatchers("/users/login").permitAll()  // Allow login without authentication
                         .anyRequest().permitAll() // Allow all requests
+                        //gyuguguygyuig
                 );
         return http.build();
     }
