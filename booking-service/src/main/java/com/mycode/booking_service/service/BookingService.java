@@ -8,9 +8,11 @@ import com.mycode.booking_service.dto.PaymentRequestDTO;
 import com.mycode.booking_service.dto.SeatDTO;
 import com.mycode.booking_service.dto.ShowDTO;
 import com.mycode.booking_service.dto.UserDTO;
+import com.mycode.booking_service.exception.*;
 import com.mycode.booking_service.model.Booking;
 import com.mycode.booking_service.model.PaymentStatus;
 import com.mycode.booking_service.repository.BookingRepository;
+import feign.FeignException;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
@@ -50,10 +52,88 @@ public class BookingService {
         log.info("Booking tickets for userId: {}, showId: {}, seatIds: {}", userId, showId, seatIds);
         // 1. Validate inputs
         if (userId == null || showId == null || seatIds == null || seatIds.isEmpty()) {
-            throw new IllegalArgumentException("User ID, Show ID, and Seat IDs are required.");
+            throw new InvalidBookingRequestException("User ID, Show ID, and Seat IDs are required.");
         }
 
-        // 2. Fetch data from other services
+
+        // 2. Fetch data from other services with robust error handling
+        UserDTO user = null;
+        try {
+            user = userClient.getUser(userId);
+            if (user == null) {
+                log.error("User with ID {} not found.", userId);
+                throw new InvalidBookingRequestException("User with ID " + userId + " not found.");
+            }
+        } catch (FeignException e) {
+            log.error("Failed to fetch user with ID {}. External service error: {}", userId, e.getMessage());
+            // Using the constructor with cause
+            throw new UserServiceClientException("Failed to fetch", e);
+        } catch (Exception e) {
+            log.error("An unexpected error occurred while fetching user {}: {}", userId, e.getMessage());
+            throw new BookingServiceException("An unexpected error occurred while fetching user " + userId, e);
+        }
+
+        ShowDTO show = null;
+        try {
+            show = showClient.getShow(showId);
+            if (show == null) {
+                log.error("Show with ID {} not found.", showId);
+                throw new ShowUnavailableException("Show with ID " + showId + " not found.");
+            }
+        } catch (FeignException e) {
+            log.error("Failed to fetch show with ID {}. External service error: {}", showId, e.getMessage());
+            throw new ShowServiceClientException(e);
+        } catch (Exception e) {
+            log.error("An unexpected error occurred while fetching show {}: {}", showId, e.getMessage());
+            throw new BookingServiceException("An unexpected error occurred while fetching show " + showId, e);
+        }
+
+        List<SeatDTO> seatDTOs = null;
+        try {
+            seatDTOs = seatIds.stream()
+                    .map(seatId -> {
+                        try {
+                            SeatDTO seat = seatClient.getSeat(seatId);
+                            if (seat == null) {
+                                log.warn("Seat with ID {} not found or invalid.", seatId);
+                                throw new SeatNotAvailableException("Seat with ID " + seatId + " not found or invalid.");
+                            }
+                            // You might want to add availability check here if `getSeat` doesn't do it
+                            // e.g., if (!seat.isAvailable()) throw new SeatNotAvailableException("Seat " + seatId + " is already booked.");
+                            return seat;
+                        } catch (FeignException e) {
+                            log.error("Failed to fetch seat with ID {}. External service error: {}", seatId, e.getMessage());
+                            throw new SeatServiceClientException(e);
+                        }
+                    })
+                    .collect(Collectors.toList());
+
+            if (seatDTOs.size() != seatIds.size()) {
+                log.warn("Mismatch in requested and retrieved seats. Some seats might be invalid.");
+                throw new InvalidBookingRequestException("One or more seat IDs are invalid or not found.");
+            }
+            // Further check for actual seat availability (if SeatDTO has a status)
+            // Assuming SeatDTO has an `isAvailable()` method
+            /*boolean anySeatNotAvailable = seatDTOs.stream().anyMatch(seat -> !seat.isAvailable());
+            if (anySeatNotAvailable) {
+                log.warn("One or more selected seats are not available.");
+                throw new SeatNotAvailableException("One or more selected seats are not available.");
+            }*/
+
+        } catch (SeatNotAvailableException | SeatServiceClientException | InvalidBookingRequestException e) {
+            throw e; // Re-throw specific seat exceptions
+        } catch (Exception e) {
+            log.error("An unexpected error occurred while fetching seats: {}", e.getMessage());
+            throw new BookingServiceException("An unexpected error occurred while fetching seats.", e);
+        }
+
+        // 3. Validate show date
+        if (show.getShowDate().isBefore(LocalDate.now())) {
+            log.warn("Attempt to book tickets for a past show (ID: {}).", showId);
+            throw new PastShowBookingException("Cannot book tickets for a past show.");
+        }
+
+       /* // 2. Fetch data from other services
         UserDTO user = userClient.getUser(userId);
         ShowDTO show = showClient.getShow(showId);
         List<SeatDTO> seatDTOs = seatIds.stream()
@@ -68,7 +148,10 @@ public class BookingService {
         // 4. Validate seat ownership and availability (mocked/assumed here)
         if (seatDTOs.size() != seatIds.size()) {
             throw new IllegalArgumentException("One or more seat IDs are invalid.");
-        }
+        }*/
+
+
+
 
         // 5. Calculate total price
 /*        double totalPrice = seatDTOs.stream()
@@ -96,6 +179,9 @@ public class BookingService {
             totalPrice *= 0.8; // Apply 20% discount
         }
 
+        log.debug("Calculated total price: {} for show ID: {} with {} seats.", totalPrice, showId, seatIds.size());
+
+        //log.info("Initial booking created with ID: {} and status: {}", booking.getId(), booking.getPaymentStatus());
 
 
         // 6. Create and save initial booking
@@ -127,10 +213,24 @@ public class BookingService {
             PaymentRequestDTO request = new PaymentRequestDTO();
             request.setBookingId(booking.getId());
             request.setAmount(totalPrice);
-
+            log.info("Attempting to process payment for booking ID: {} with amount: {}", booking.getId(), totalPrice);
             paymentClient.processPayment(request);
             booking.setPaymentStatus(PaymentStatus.SUCCESSFUL);
+            log.info("Payment successful for booking ID: {}", booking.getId());
+        } catch (FeignException e) {
+            log.error("Payment failed for booking ID {} due to external payment service error: {}", booking.getId(), e.getMessage());
+            booking.setPaymentStatus(PaymentStatus.FAILED);
+            bookingRepository.save(booking);
+            throw new PaymentServiceException("Payment failed" + e.getMessage()); // Use constructor with cause
         } catch (Exception e) {
+            log.error("An unexpected error occurred during payment for booking ID {}: {}", booking.getId(), e.getMessage());
+            booking.setPaymentStatus(PaymentStatus.FAILED);
+            bookingRepository.save(booking);
+            throw new BookingServiceException("Payment failed", e); // Use constructor with cause
+        }
+
+
+/*        } catch (Exception e) {
             booking.setPaymentStatus(PaymentStatus.FAILED);
             bookingRepository.save(booking);
 
@@ -139,7 +239,7 @@ public class BookingService {
             System.out.println("Booking Service Error: " + e.getMessage());
 
             throw new RuntimeException("Payment failed: " + e.getMessage());
-        }
+        }*/
 
 
 
@@ -147,7 +247,14 @@ public class BookingService {
         return bookingRepository.save(booking);
     }
 
-    public Booking getBookingById(Long id) {
-        return bookingRepository.findById(id).orElse(null);
-    }
+        public Booking getBookingById(Long id) {
+            log.info("Fetching booking with ID: {}", id);
+            return bookingRepository.findById(id)
+                    .orElseThrow(() -> {
+                        log.warn("Booking with ID {} not found.", id);
+                        // Use the default message for the error code, or provide a specific message
+                        throw new InvalidBookingRequestException("Booking with ID " + id + " not found.");
+                    });
+        }
 }
+
